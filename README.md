@@ -24,6 +24,31 @@ In one line: safer, more stable, and more controllable web fetching for AI agent
 - OpenClaw ready: skill templates + `mcporter` examples
 - Beginner-friendly: one-command bootstrap scripts
 
+## Prerequisites
+
+Before installation, make sure these dependencies exist on your machine:
+
+- Python `>= 3.10` (recommended: `3.11`)
+- `mcporter` available in your `PATH`
+- OpenClaw with local agent/skills support
+
+Quick checks:
+
+```bash
+python3 --version
+which mcporter
+mcporter --help
+openclaw --version
+```
+
+If `mcporter` is missing, install it first (example options):
+
+```bash
+pip install mcporter
+# or
+uv pip install mcporter
+```
+
 ## Quick Start
 
 > `~/` and `<YOUR_PATH>` both represent your local clone path. Replace them with your actual location.
@@ -101,6 +126,40 @@ These fields form a stable JSON response contract for agent status checks, retry
 ## Environment Variable
 
 - `WEBFETCH_ALLOW_CIDRS` (optional): comma-separated CIDR allowlist for special network environments.
+
+## Troubleshooting
+
+### Skill does not load in OpenClaw
+
+Most common cause: `mcporter` is not installed or not in `PATH`.
+
+```bash
+which mcporter
+```
+
+If empty, install `mcporter`, then restart OpenClaw and run:
+
+```bash
+openclaw skills list
+```
+
+### DNS/IP gets blocked unexpectedly
+
+In some network environments, public domains may resolve into restricted ranges.
+Use an allowlist CIDR for those environments:
+
+```bash
+WEBFETCH_ALLOW_CIDRS=198.18.0.0/15 python server.py --self-test
+```
+
+### Python command not found inside bootstrap script
+
+Create the venv manually and rerun:
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
 
 ## Project Files
 
