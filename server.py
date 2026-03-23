@@ -2,19 +2,28 @@
 import argparse
 import ipaddress
 import json
+import logging
 import os
 import socket
 import time
 import zlib
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
 import trafilatura
 from bs4 import BeautifulSoup
 from charset_normalizer import from_bytes
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 try:
     from mcp.server.fastmcp import FastMCP  # type: ignore
@@ -38,6 +47,7 @@ except Exception:  # pragma: no cover
 
 
 APP_NAME = "safefetch-v1"
+USER_AGENT = f"{APP_NAME}/1.0"
 MAX_REDIRECTS = 5
 MAX_RAW_BYTES = 5 * 1024 * 1024
 MAX_DECOMPRESSED_BYTES = 8 * 1024 * 1024
@@ -46,11 +56,12 @@ MAX_RETRIES = 2
 CONNECT_TIMEOUT = 5.0
 READ_TIMEOUT = 15.0
 RATE_LIMIT_RPM = 20
+RATE_LIMIT_MAX_CALLERS = 1000  # Prevent memory leak
 ALLOW_HTTPS_DOWNGRADE = False
 MIME_ALLOWLIST = ("text/html", "text/plain", "application/json")
 RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
-_RATE_BUCKET: Dict[str, List[float]] = {}
+_RATE_BUCKET: Dict[str, List[float]] = OrderedDict()
 mcp = FastMCP(APP_NAME) if FastMCP is not None else None
 
 
@@ -65,8 +76,11 @@ def parse_allow_cidrs() -> List[ipaddress._BaseNetwork]:
             continue
         try:
             nets.append(ipaddress.ip_network(val, strict=False))
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Invalid CIDR in WEBFETCH_ALLOW_CIDRS: {val!r} - {e}")
             continue
+    if nets:
+        logger.info(f"Loaded {len(nets)} CIDR allowlist entries")
     return nets
 
 
@@ -126,8 +140,9 @@ def is_blocked_ip(ip_text: str) -> bool:
     ip = ipaddress.ip_address(ip_text)
     for net in ALLOW_CIDRS:
         if ip in net:
+            logger.debug(f"IP {ip_text} allowed by CIDR allowlist")
             return False
-    return (
+    blocked = (
         ip.is_private
         or ip.is_loopback
         or ip.is_link_local
@@ -135,6 +150,9 @@ def is_blocked_ip(ip_text: str) -> bool:
         or ip.is_reserved
         or ip.is_unspecified
     )
+    if blocked:
+        logger.info(f"IP {ip_text} blocked (private/loopback/reserved)")
+    return blocked
 
 
 def resolve_host_ips(hostname: str) -> List[str]:
@@ -165,37 +183,61 @@ def resolve_host_ips(hostname: str) -> List[str]:
 def validate_url_and_dns(url: str) -> Tuple[bool, str]:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
+        logger.info(f"Blocked invalid scheme: {parsed.scheme} for {url}")
         return False, "invalid_scheme"
     if parsed.username or parsed.password:
+        logger.warning(f"Blocked URL with userinfo: {url}")
         return False, "userinfo_not_allowed"
     if not parsed.hostname:
+        logger.warning(f"Blocked URL with missing hostname: {url}")
         return False, "missing_hostname"
     host = parsed.hostname.strip().lower()
     if host in ("localhost",):
+        logger.info(f"Blocked localhost: {url}")
         return False, "localhost_blocked"
     try:
         ipaddress.ip_address(host)
         if is_blocked_ip(host):
             return False, "ip_blocked"
+        logger.debug(f"Direct IP address validated: {host}")
         return True, ""
     except ValueError:
         pass
+    # DNS resolution - NOTE: TOCTOU risk exists here
+    # The DNS may resolve differently when httpx actually makes the request
+    # For maximum security, consider network-level controls (firewall rules)
     ips = resolve_host_ips(host)
     if not ips:
+        logger.warning(f"DNS resolution failed for: {host}")
         return False, "dns_resolution_failed"
+    logger.debug(f"DNS resolved {host} to {len(ips)} IPs: {ips}")
     for ip_text in ips:
         if is_blocked_ip(ip_text):
+            logger.warning(f"DNS resolved to blocked IP: {host} -> {ip_text}")
             return False, "dns_ip_blocked"
     return True, ""
 
 
 def allow_request(caller_id: str) -> bool:
     now = time.time()
+
+    # Clean up old callers to prevent memory leak
+    if len(_RATE_BUCKET) > RATE_LIMIT_MAX_CALLERS:
+        # Remove oldest entries
+        for _ in range(len(_RATE_BUCKET) - RATE_LIMIT_MAX_CALLERS + 100):
+            _RATE_BUCKET.popitem(last=False)
+        logger.warning(f"Rate limit bucket cleanup: removed old entries")
+
     history = _RATE_BUCKET.setdefault(caller_id, [])
     history[:] = [x for x in history if now - x <= 60.0]
+
     if len(history) >= RATE_LIMIT_RPM:
+        logger.info(f"Rate limit exceeded for caller_id={caller_id}")
         return False
+
     history.append(now)
+    # Move to end to maintain LRU order
+    _RATE_BUCKET.move_to_end(caller_id)
     return True
 
 
@@ -267,6 +309,24 @@ def truncate_markdown(md: str, max_tokens: int) -> Tuple[str, bool]:
 
 
 def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
+    """
+    Fetch a URL once with security checks.
+
+    Security Note - DNS TOCTOU:
+    There is a theoretical Time-Of-Check-Time-Of-Use (TOCTOU) race condition
+    between our DNS validation and httpx's actual connection. An attacker with
+    control over DNS could change the resolution between these two points.
+
+    Mitigations in place:
+    1. We re-validate DNS on every redirect hop (reduces window)
+    2. We log all DNS resolutions for audit trails
+    3. Network-level controls (firewall rules) are recommended for defense-in-depth
+
+    For maximum security in hostile environments, consider:
+    - Using WEBFETCH_ALLOW_CIDRS to explicitly allowlist safe IP ranges
+    - Deploying network-level egress filtering
+    - Running in a sandboxed network namespace
+    """
     fetched_at = now_utc()
     ok, reason = validate_url_and_dns(url)
     if not ok:
@@ -288,7 +348,7 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
 
     timeout = httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=READ_TIMEOUT, pool=READ_TIMEOUT)
     headers = {
-        "User-Agent": "OpenClaw-WebFetch-V1/1.0",
+        "User-Agent": USER_AGENT,
         "Accept": "text/html,text/plain,application/json;q=0.9,*/*;q=0.1",
         "Accept-Encoding": "gzip,deflate,identity",
     }
@@ -296,12 +356,34 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
     current_url = url
     raw_total = 0
     dec_total = 0
+    visited_urls: Set[str] = set()  # Track visited URLs to detect loops
 
     with httpx.Client(timeout=timeout, headers=headers, follow_redirects=False) as client:
         while True:
+            # Check for redirect loops
+            if current_url in visited_urls:
+                logger.warning(f"Redirect loop detected: {current_url}")
+                return FetchResult(
+                    ok=False,
+                    fetch_status="blocked",
+                    blocked_reason="redirect_loop_detected",
+                    final_url=current_url,
+                    status_code=0,
+                    content_type="",
+                    title="",
+                    markdown="",
+                    fetched_at=fetched_at,
+                    redirects=redirects,
+                    raw_bytes=raw_total,
+                    decompressed_bytes=dec_total,
+                    truncated=False,
+                )
+            visited_urls.add(current_url)
+
             # Re-validate every hop, blocks redirect-based bypass.
             ok_hop, reason_hop = validate_url_and_dns(current_url)
             if not ok_hop:
+                logger.warning(f"URL validation failed at redirect hop: {reason_hop} for {current_url}")
                 return FetchResult(
                     ok=False,
                     fetch_status="blocked",
@@ -323,6 +405,7 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
                     status = int(resp.status_code)
                     if status in (301, 302, 303, 307, 308):
                         if redirects >= MAX_REDIRECTS:
+                            logger.warning(f"Too many redirects: {redirects} for {current_url}")
                             return FetchResult(
                                 ok=False,
                                 fetch_status="blocked",
@@ -340,6 +423,7 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
                             )
                         nxt = urljoin(current_url, resp.headers.get("location", ""))
                         if not nxt:
+                            logger.warning(f"Invalid redirect location from {current_url}")
                             return FetchResult(
                                 ok=False,
                                 fetch_status="error",
@@ -356,6 +440,7 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
                                 truncated=False,
                             )
                         if (not ALLOW_HTTPS_DOWNGRADE) and urlparse(current_url).scheme == "https" and urlparse(nxt).scheme == "http":
+                            logger.warning(f"HTTPS downgrade blocked: {current_url} -> {nxt}")
                             return FetchResult(
                                 ok=False,
                                 fetch_status="blocked",
@@ -394,6 +479,7 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
 
                     content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
                     if content_type and content_type not in MIME_ALLOWLIST:
+                        logger.info(f"Blocked MIME type: {content_type} for {current_url}")
                         return FetchResult(
                             ok=False,
                             fetch_status="blocked",
@@ -432,6 +518,7 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
                     for chunk in resp.iter_raw():
                         raw_total += len(chunk)
                         if raw_total > MAX_RAW_BYTES:
+                            logger.warning(f"Raw size exceeded: {raw_total} bytes for {current_url}")
                             return FetchResult(
                                 ok=False,
                                 fetch_status="blocked",
@@ -450,6 +537,7 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
                         decoded = decompress_chunk(mode, dec, chunk)
                         dec_total += len(decoded)
                         if dec_total > MAX_DECOMPRESSED_BYTES:
+                            logger.warning(f"Decompressed size exceeded: {dec_total} bytes for {current_url}")
                             return FetchResult(
                                 ok=False,
                                 fetch_status="blocked",
@@ -503,6 +591,9 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
                         markdown = soup.get_text("\n", strip=True)
                     markdown = markdown.strip()
                     markdown, truncated = truncate_markdown(markdown, max_tokens=max_tokens)
+
+                    logger.info(f"Successfully fetched {current_url}: {status}, {len(markdown)} chars, {redirects} redirects, truncated={truncated}")
+
                     metadata_header = (
                         "# Source\n\n"
                         f"- Title: {title or 'N/A'}\n"
@@ -525,7 +616,8 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
                         decompressed_bytes=dec_total,
                         truncated=truncated,
                     )
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as exc:
+                logger.warning(f"Request timeout for {current_url}: {exc}")
                 return FetchResult(
                     ok=False,
                     fetch_status="timeout",
@@ -542,6 +634,7 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
                     truncated=False,
                 )
             except httpx.HTTPError as exc:
+                logger.error(f"HTTP error for {current_url}: {exc.__class__.__name__} - {exc}")
                 return FetchResult(
                     ok=False,
                     fetch_status="error",
@@ -558,6 +651,7 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
                     truncated=False,
                 )
             except Exception as exc:  # pragma: no cover
+                logger.error(f"Unexpected error for {current_url}: {exc.__class__.__name__} - {exc}")
                 return FetchResult(
                     ok=False,
                     fetch_status="error",
