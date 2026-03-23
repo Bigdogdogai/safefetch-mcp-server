@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+import argparse
+import ipaddress
+import json
+import os
+import socket
+import time
+import zlib
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple
+from urllib.parse import urljoin, urlparse
+
+import httpx
+import trafilatura
+from bs4 import BeautifulSoup
+from charset_normalizer import from_bytes
+
+try:
+    from mcp.server.fastmcp import FastMCP  # type: ignore
+except Exception:  # pragma: no cover
+    FastMCP = None
+
+try:
+    import dns.resolver  # type: ignore
+except Exception:  # pragma: no cover
+    dns = None
+
+try:
+    import brotli  # type: ignore
+except Exception:  # pragma: no cover
+    brotli = None
+
+try:
+    import tiktoken  # type: ignore
+except Exception:  # pragma: no cover
+    tiktoken = None
+
+
+APP_NAME = "webfetch-v1"
+MAX_REDIRECTS = 5
+MAX_RAW_BYTES = 5 * 1024 * 1024
+MAX_DECOMPRESSED_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_TOKENS = 3000
+MAX_RETRIES = 2
+CONNECT_TIMEOUT = 5.0
+READ_TIMEOUT = 15.0
+RATE_LIMIT_RPM = 20
+ALLOW_HTTPS_DOWNGRADE = False
+MIME_ALLOWLIST = ("text/html", "text/plain", "application/json")
+RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+_RATE_BUCKET: Dict[str, List[float]] = {}
+mcp = FastMCP(APP_NAME) if FastMCP is not None else None
+
+
+def parse_allow_cidrs() -> List[ipaddress._BaseNetwork]:
+    raw = os.getenv("WEBFETCH_ALLOW_CIDRS", "").strip()
+    if not raw:
+        return []
+    nets: List[ipaddress._BaseNetwork] = []
+    for part in raw.split(","):
+        val = part.strip()
+        if not val:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(val, strict=False))
+        except Exception:
+            continue
+    return nets
+
+
+ALLOW_CIDRS = parse_allow_cidrs()
+
+
+@dataclass
+class FetchResult:
+    ok: bool
+    fetch_status: str
+    blocked_reason: str
+    final_url: str
+    status_code: int
+    content_type: str
+    title: str
+    markdown: str
+    fetched_at: str
+    redirects: int
+    raw_bytes: int
+    decompressed_bytes: int
+    truncated: bool
+    attempts: int = 1
+    retried: bool = False
+    retryable_error: bool = False
+    last_error: str = ""
+    security_blocked: bool = False
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "ok": self.ok,
+            "fetch_status": self.fetch_status,
+            "blocked_reason": self.blocked_reason,
+            "final_url": self.final_url,
+            "status_code": self.status_code,
+            "content_type": self.content_type,
+            "title": self.title,
+            "content_markdown": self.markdown,
+            "content_chars": len(self.markdown or ""),
+            "fetched_at": self.fetched_at,
+            "redirects": self.redirects,
+            "raw_bytes": self.raw_bytes,
+            "decompressed_bytes": self.decompressed_bytes,
+            "truncated": self.truncated,
+            "attempts": self.attempts,
+            "retried": self.retried,
+            "retryable_error": self.retryable_error,
+            "last_error": self.last_error,
+            "security_blocked": self.security_blocked,
+        }
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def is_blocked_ip(ip_text: str) -> bool:
+    ip = ipaddress.ip_address(ip_text)
+    for net in ALLOW_CIDRS:
+        if ip in net:
+            return False
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def resolve_host_ips(hostname: str) -> List[str]:
+    ips: List[str] = []
+    # DNS query path
+    if dns is not None:
+        try:
+            for rr in dns.resolver.resolve(hostname, "A", lifetime=2.0):
+                ips.append(rr.to_text())
+        except Exception:
+            pass
+        try:
+            for rr in dns.resolver.resolve(hostname, "AAAA", lifetime=2.0):
+                ips.append(rr.to_text())
+        except Exception:
+            pass
+    # Socket fallback
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+        for info in infos:
+            addr = info[4][0]
+            ips.append(addr)
+    except Exception:
+        pass
+    return sorted(list(set(ips)))
+
+
+def validate_url_and_dns(url: str) -> Tuple[bool, str]:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False, "invalid_scheme"
+    if parsed.username or parsed.password:
+        return False, "userinfo_not_allowed"
+    if not parsed.hostname:
+        return False, "missing_hostname"
+    host = parsed.hostname.strip().lower()
+    if host in ("localhost",):
+        return False, "localhost_blocked"
+    try:
+        ipaddress.ip_address(host)
+        if is_blocked_ip(host):
+            return False, "ip_blocked"
+        return True, ""
+    except ValueError:
+        pass
+    ips = resolve_host_ips(host)
+    if not ips:
+        return False, "dns_resolution_failed"
+    for ip_text in ips:
+        if is_blocked_ip(ip_text):
+            return False, "dns_ip_blocked"
+    return True, ""
+
+
+def allow_request(caller_id: str) -> bool:
+    now = time.time()
+    history = _RATE_BUCKET.setdefault(caller_id, [])
+    history[:] = [x for x in history if now - x <= 60.0]
+    if len(history) >= RATE_LIMIT_RPM:
+        return False
+    history.append(now)
+    return True
+
+
+def get_decompressor(content_encoding: str):
+    ce = (content_encoding or "").lower().strip()
+    if ce in ("", "identity"):
+        return "identity", None
+    if ce == "gzip":
+        return "gzip", zlib.decompressobj(16 + zlib.MAX_WBITS)
+    if ce == "deflate":
+        return "deflate", zlib.decompressobj()
+    if ce == "br" and brotli is not None:
+        return "br", brotli.Decompressor()
+    return "unsupported", None
+
+
+def decompress_chunk(mode: str, dec, chunk: bytes) -> bytes:
+    if mode == "identity":
+        return chunk
+    if mode in ("gzip", "deflate"):
+        return dec.decompress(chunk)
+    if mode == "br":
+        return dec.process(chunk)
+    return b""
+
+
+def decompress_flush(mode: str, dec) -> bytes:
+    if mode in ("gzip", "deflate"):
+        return dec.flush()
+    return b""
+
+
+def decode_bytes(data: bytes, content_type: str) -> str:
+    charset = ""
+    parts = [p.strip() for p in content_type.split(";")]
+    for p in parts[1:]:
+        if p.lower().startswith("charset="):
+            charset = p.split("=", 1)[1].strip().strip('"').strip("'")
+            break
+    if charset:
+        try:
+            return data.decode(charset, errors="replace")
+        except Exception:
+            pass
+    best = from_bytes(data).best()
+    if best and best.encoding:
+        try:
+            return str(best)
+        except Exception:
+            pass
+    return data.decode("utf-8", errors="replace")
+
+
+def truncate_markdown(md: str, max_tokens: int) -> Tuple[str, bool]:
+    if max_tokens <= 0:
+        return md, False
+    if tiktoken is None:
+        # rough fallback: 1 token ~= 4 chars
+        cap = max_tokens * 4
+        if len(md) <= cap:
+            return md, False
+        return md[:cap] + "\n\n...[Content Truncated]", True
+    enc = tiktoken.get_encoding("cl100k_base")
+    tokens = enc.encode(md)
+    if len(tokens) <= max_tokens:
+        return md, False
+    truncated = enc.decode(tokens[:max_tokens]).rstrip() + "\n\n...[Content Truncated]"
+    return truncated, True
+
+
+def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
+    fetched_at = now_utc()
+    ok, reason = validate_url_and_dns(url)
+    if not ok:
+        return FetchResult(
+            ok=False,
+            fetch_status="blocked",
+            blocked_reason=reason,
+            final_url=url,
+            status_code=0,
+            content_type="",
+            title="",
+            markdown="",
+            fetched_at=fetched_at,
+            redirects=0,
+            raw_bytes=0,
+            decompressed_bytes=0,
+            truncated=False,
+        )
+
+    timeout = httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=READ_TIMEOUT, pool=READ_TIMEOUT)
+    headers = {
+        "User-Agent": "OpenClaw-WebFetch-V1/1.0",
+        "Accept": "text/html,text/plain,application/json;q=0.9,*/*;q=0.1",
+        "Accept-Encoding": "gzip,deflate,identity",
+    }
+    redirects = 0
+    current_url = url
+    raw_total = 0
+    dec_total = 0
+
+    with httpx.Client(timeout=timeout, headers=headers, follow_redirects=False) as client:
+        while True:
+            # Re-validate every hop, blocks redirect-based bypass.
+            ok_hop, reason_hop = validate_url_and_dns(current_url)
+            if not ok_hop:
+                return FetchResult(
+                    ok=False,
+                    fetch_status="blocked",
+                    blocked_reason=f"redirect_{reason_hop}",
+                    final_url=current_url,
+                    status_code=0,
+                    content_type="",
+                    title="",
+                    markdown="",
+                    fetched_at=fetched_at,
+                    redirects=redirects,
+                    raw_bytes=raw_total,
+                    decompressed_bytes=dec_total,
+                    truncated=False,
+                )
+
+            try:
+                with client.stream("GET", current_url) as resp:
+                    status = int(resp.status_code)
+                    if status in (301, 302, 303, 307, 308):
+                        if redirects >= MAX_REDIRECTS:
+                            return FetchResult(
+                                ok=False,
+                                fetch_status="blocked",
+                                blocked_reason="too_many_redirects",
+                                final_url=current_url,
+                                status_code=status,
+                                content_type=resp.headers.get("content-type", ""),
+                                title="",
+                                markdown="",
+                                fetched_at=fetched_at,
+                                redirects=redirects,
+                                raw_bytes=raw_total,
+                                decompressed_bytes=dec_total,
+                                truncated=False,
+                            )
+                        nxt = urljoin(current_url, resp.headers.get("location", ""))
+                        if not nxt:
+                            return FetchResult(
+                                ok=False,
+                                fetch_status="error",
+                                blocked_reason="invalid_redirect_location",
+                                final_url=current_url,
+                                status_code=status,
+                                content_type=resp.headers.get("content-type", ""),
+                                title="",
+                                markdown="",
+                                fetched_at=fetched_at,
+                                redirects=redirects,
+                                raw_bytes=raw_total,
+                                decompressed_bytes=dec_total,
+                                truncated=False,
+                            )
+                        if (not ALLOW_HTTPS_DOWNGRADE) and urlparse(current_url).scheme == "https" and urlparse(nxt).scheme == "http":
+                            return FetchResult(
+                                ok=False,
+                                fetch_status="blocked",
+                                blocked_reason="https_downgrade_blocked",
+                                final_url=nxt,
+                                status_code=status,
+                                content_type=resp.headers.get("content-type", ""),
+                                title="",
+                                markdown="",
+                                fetched_at=fetched_at,
+                                redirects=redirects,
+                                raw_bytes=raw_total,
+                                decompressed_bytes=dec_total,
+                                truncated=False,
+                            )
+                        redirects += 1
+                        current_url = nxt
+                        continue
+
+                    if status < 200 or status >= 400:
+                        return FetchResult(
+                            ok=False,
+                            fetch_status="http_error",
+                            blocked_reason=f"http_{status}",
+                            final_url=current_url,
+                            status_code=status,
+                            content_type=resp.headers.get("content-type", ""),
+                            title="",
+                            markdown="",
+                            fetched_at=fetched_at,
+                            redirects=redirects,
+                            raw_bytes=raw_total,
+                            decompressed_bytes=dec_total,
+                            truncated=False,
+                        )
+
+                    content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                    if content_type and content_type not in MIME_ALLOWLIST:
+                        return FetchResult(
+                            ok=False,
+                            fetch_status="blocked",
+                            blocked_reason="mime_not_allowed",
+                            final_url=current_url,
+                            status_code=status,
+                            content_type=resp.headers.get("content-type", ""),
+                            title="",
+                            markdown="",
+                            fetched_at=fetched_at,
+                            redirects=redirects,
+                            raw_bytes=raw_total,
+                            decompressed_bytes=dec_total,
+                            truncated=False,
+                        )
+
+                    mode, dec = get_decompressor(resp.headers.get("content-encoding", ""))
+                    if mode == "unsupported":
+                        return FetchResult(
+                            ok=False,
+                            fetch_status="blocked",
+                            blocked_reason="unsupported_content_encoding",
+                            final_url=current_url,
+                            status_code=status,
+                            content_type=resp.headers.get("content-type", ""),
+                            title="",
+                            markdown="",
+                            fetched_at=fetched_at,
+                            redirects=redirects,
+                            raw_bytes=raw_total,
+                            decompressed_bytes=dec_total,
+                            truncated=False,
+                        )
+
+                    out = bytearray()
+                    for chunk in resp.iter_raw():
+                        raw_total += len(chunk)
+                        if raw_total > MAX_RAW_BYTES:
+                            return FetchResult(
+                                ok=False,
+                                fetch_status="blocked",
+                                blocked_reason="raw_size_exceeded",
+                                final_url=current_url,
+                                status_code=status,
+                                content_type=resp.headers.get("content-type", ""),
+                                title="",
+                                markdown="",
+                                fetched_at=fetched_at,
+                                redirects=redirects,
+                                raw_bytes=raw_total,
+                                decompressed_bytes=dec_total,
+                                truncated=False,
+                            )
+                        decoded = decompress_chunk(mode, dec, chunk)
+                        dec_total += len(decoded)
+                        if dec_total > MAX_DECOMPRESSED_BYTES:
+                            return FetchResult(
+                                ok=False,
+                                fetch_status="blocked",
+                                blocked_reason="decompressed_size_exceeded",
+                                final_url=current_url,
+                                status_code=status,
+                                content_type=resp.headers.get("content-type", ""),
+                                title="",
+                                markdown="",
+                                fetched_at=fetched_at,
+                                redirects=redirects,
+                                raw_bytes=raw_total,
+                                decompressed_bytes=dec_total,
+                                truncated=False,
+                            )
+                        out.extend(decoded)
+                    remain = decompress_flush(mode, dec)
+                    if remain:
+                        dec_total += len(remain)
+                        if dec_total > MAX_DECOMPRESSED_BYTES:
+                            return FetchResult(
+                                ok=False,
+                                fetch_status="blocked",
+                                blocked_reason="decompressed_size_exceeded",
+                                final_url=current_url,
+                                status_code=status,
+                                content_type=resp.headers.get("content-type", ""),
+                                title="",
+                                markdown="",
+                                fetched_at=fetched_at,
+                                redirects=redirects,
+                                raw_bytes=raw_total,
+                                decompressed_bytes=dec_total,
+                                truncated=False,
+                            )
+                        out.extend(remain)
+
+                    html_or_text = decode_bytes(bytes(out), resp.headers.get("content-type", ""))
+                    soup = BeautifulSoup(html_or_text, "html.parser")
+                    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+                    markdown = trafilatura.extract(
+                        html_or_text,
+                        output_format="markdown",
+                        include_comments=False,
+                        include_tables=True,
+                        include_images=False,
+                        deduplicate=True,
+                        favor_precision=True,
+                    )
+                    if not markdown:
+                        markdown = soup.get_text("\n", strip=True)
+                    markdown = markdown.strip()
+                    markdown, truncated = truncate_markdown(markdown, max_tokens=max_tokens)
+                    metadata_header = (
+                        "# Source\n\n"
+                        f"- Title: {title or 'N/A'}\n"
+                        f"- URL: {current_url}\n"
+                        f"- Fetched At: {fetched_at}\n"
+                        f"- Content-Type: {resp.headers.get('content-type', '')}\n\n"
+                    )
+                    return FetchResult(
+                        ok=True,
+                        fetch_status="ok",
+                        blocked_reason="",
+                        final_url=current_url,
+                        status_code=status,
+                        content_type=resp.headers.get("content-type", ""),
+                        title=title,
+                        markdown=(metadata_header + markdown).strip(),
+                        fetched_at=fetched_at,
+                        redirects=redirects,
+                        raw_bytes=raw_total,
+                        decompressed_bytes=dec_total,
+                        truncated=truncated,
+                    )
+            except httpx.TimeoutException:
+                return FetchResult(
+                    ok=False,
+                    fetch_status="timeout",
+                    blocked_reason="request_timeout",
+                    final_url=current_url,
+                    status_code=0,
+                    content_type="",
+                    title="",
+                    markdown="",
+                    fetched_at=fetched_at,
+                    redirects=redirects,
+                    raw_bytes=raw_total,
+                    decompressed_bytes=dec_total,
+                    truncated=False,
+                )
+            except httpx.HTTPError as exc:
+                return FetchResult(
+                    ok=False,
+                    fetch_status="error",
+                    blocked_reason=f"httpx_error:{exc.__class__.__name__}",
+                    final_url=current_url,
+                    status_code=0,
+                    content_type="",
+                    title="",
+                    markdown="",
+                    fetched_at=fetched_at,
+                    redirects=redirects,
+                    raw_bytes=raw_total,
+                    decompressed_bytes=dec_total,
+                    truncated=False,
+                )
+            except Exception as exc:  # pragma: no cover
+                return FetchResult(
+                    ok=False,
+                    fetch_status="error",
+                    blocked_reason=f"unexpected:{exc.__class__.__name__}",
+                    final_url=current_url,
+                    status_code=0,
+                    content_type="",
+                    title="",
+                    markdown="",
+                    fetched_at=fetched_at,
+                    redirects=redirects,
+                    raw_bytes=raw_total,
+                    decompressed_bytes=dec_total,
+                    truncated=False,
+                )
+
+
+def is_security_block(result: FetchResult) -> bool:
+    if result.fetch_status != "blocked":
+        return False
+    reason = (result.blocked_reason or "").lower()
+    security_markers = (
+        "invalid_scheme",
+        "userinfo_not_allowed",
+        "missing_hostname",
+        "localhost_blocked",
+        "ip_blocked",
+        "dns_ip_blocked",
+        "dns_resolution_failed",
+        "redirect_",
+        "https_downgrade_blocked",
+        "mime_not_allowed",
+        "unsupported_content_encoding",
+        "raw_size_exceeded",
+        "decompressed_size_exceeded",
+    )
+    return any(reason.startswith(x) for x in security_markers)
+
+
+def is_retryable_result(result: FetchResult) -> bool:
+    if result.ok:
+        return False
+    if is_security_block(result):
+        return False
+    if result.fetch_status == "timeout":
+        return True
+    if result.fetch_status == "http_error" and result.status_code in RETRYABLE_HTTP_STATUS:
+        return True
+    if result.fetch_status == "error" and str(result.blocked_reason).startswith("httpx_error:"):
+        return True
+    return False
+
+
+def fetch_core(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
+    attempts = 0
+    last = FetchResult(
+        ok=False,
+        fetch_status="error",
+        blocked_reason="unknown",
+        final_url=url,
+        status_code=0,
+        content_type="",
+        title="",
+        markdown="",
+        fetched_at=now_utc(),
+        redirects=0,
+        raw_bytes=0,
+        decompressed_bytes=0,
+        truncated=False,
+    )
+    while attempts <= MAX_RETRIES:
+        attempts += 1
+        result = fetch_once(url=url, max_tokens=max_tokens)
+        result.attempts = attempts
+        result.security_blocked = is_security_block(result)
+        result.retryable_error = is_retryable_result(result)
+        result.last_error = result.blocked_reason
+        result.retried = attempts > 1
+        last = result
+        if result.ok:
+            return result
+        if not result.retryable_error:
+            return result
+        if attempts <= MAX_RETRIES:
+            time.sleep(0.35 * attempts)
+    return last
+
+
+def _fetch_url_impl(url: str, caller_id: str = "default", max_tokens: int = DEFAULT_MAX_TOKENS) -> Dict[str, object]:
+    """Fetch webpage content safely and return markdown for LLM usage."""
+    if not allow_request(caller_id):
+        return FetchResult(
+            ok=False,
+            fetch_status="blocked",
+            blocked_reason="rate_limited",
+            final_url=url,
+            status_code=0,
+            content_type="",
+            title="",
+            markdown="",
+            fetched_at=now_utc(),
+            redirects=0,
+            raw_bytes=0,
+            decompressed_bytes=0,
+            truncated=False,
+        ).to_dict()
+    return fetch_core(url=url, max_tokens=max_tokens).to_dict()
+
+
+if mcp is not None:
+
+    @mcp.tool()
+    def fetch_url(url: str, caller_id: str = "default", max_tokens: int = DEFAULT_MAX_TOKENS) -> Dict[str, object]:
+        return _fetch_url_impl(url=url, caller_id=caller_id, max_tokens=max_tokens)
+
+else:
+    def fetch_url(url: str, caller_id: str = "default", max_tokens: int = DEFAULT_MAX_TOKENS) -> Dict[str, object]:
+        return _fetch_url_impl(url=url, caller_id=caller_id, max_tokens=max_tokens)
+
+
+def run_self_test() -> int:
+    tests = [
+        ("blocked_localhost", "http://127.0.0.1"),
+        ("normal_public", "https://httpbin.org/get"),
+        ("redirect_public", "http://httpbin.org/redirect-to?url=https://httpbin.org/get"),
+    ]
+    passed = 0
+    for name, url in tests:
+        result = fetch_core(url=url, max_tokens=800).to_dict()
+        print(json.dumps({"test": name, "result": result}, ensure_ascii=False))
+        if name == "blocked_localhost":
+            if result["ok"] is False and str(result["blocked_reason"]).startswith("ip_blocked"):
+                passed += 1
+        elif result["ok"] is True:
+            passed += 1
+    print(json.dumps({"summary": f"{passed}/{len(tests)} passed"}, ensure_ascii=False))
+    return 0 if passed == len(tests) else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="SafeFetch MCP Server V1")
+    parser.add_argument("--self-test", action="store_true", help="run local tests and exit")
+    parser.add_argument("--url", default="", help="single URL fetch debug")
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    args = parser.parse_args()
+    if args.self_test:
+        return run_self_test()
+    if args.url:
+        print(json.dumps(fetch_core(args.url, max_tokens=args.max_tokens).to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if mcp is None:
+        print(json.dumps({"ok": False, "error": "mcp package unavailable; requires Python >= 3.10 for MCP mode"}, ensure_ascii=False))
+        return 2
+    mcp.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
