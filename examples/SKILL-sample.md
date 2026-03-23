@@ -1,6 +1,6 @@
 ---
-name: webfetch-mcp-v1
-description: Use hardened WebFetch MCP server via mcporter stdio with SSRF/resource/result guardrails.
+name: safefetch-mcp-v1
+description: Use hardened SafeFetch MCP server via mcporter stdio with SSRF/resource/result guardrails.
 allowed-tools: Bash(mcporter *)
 metadata:
   {
@@ -12,9 +12,9 @@ metadata:
   }
 ---
 
-# webfetch-mcp-v1 (sample)
+# safefetch-mcp-v1 (sample)
 
-Call the local hardened WebFetch MCP server through `mcporter` stdio.
+Call the local hardened SafeFetch MCP server through `mcporter` stdio.
 
 Server command:
 

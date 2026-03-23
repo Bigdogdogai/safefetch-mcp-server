@@ -37,7 +37,7 @@ except Exception:  # pragma: no cover
     tiktoken = None
 
 
-APP_NAME = "webfetch-v1"
+APP_NAME = "safefetch-v1"
 MAX_REDIRECTS = 5
 MAX_RAW_BYTES = 5 * 1024 * 1024
 MAX_DECOMPRESSED_BYTES = 8 * 1024 * 1024

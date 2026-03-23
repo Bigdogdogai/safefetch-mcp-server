@@ -60,14 +60,14 @@ WEBFETCH_ALLOW_CIDRS=198.18.0.0/15 python server.py --self-test
 2. Copy skill file:
 
 ```bash
-mkdir -p ~/.openclaw/skills/webfetch-mcp-v1
-cp ~/safefetch-mcp-server/examples/SKILL.local.md ~/.openclaw/skills/webfetch-mcp-v1/SKILL.md
+mkdir -p ~/.openclaw/skills/safefetch-mcp-v1
+cp ~/safefetch-mcp-server/examples/SKILL.local.md ~/.openclaw/skills/safefetch-mcp-v1/SKILL.md
 ```
 
 3. Hello world:
 
 ```bash
-openclaw agent --local --message "Use webfetch-mcp-v1 to fetch https://httpbin.org/get. Output strict JSON only (no markdown code fences) with fields: ok, fetch_status, blocked_reason, final_url, attempts, retryable_error, security_blocked, title."
+openclaw agent --local --message "Use safefetch-mcp-v1 to fetch https://httpbin.org/get. Output strict JSON only (no markdown code fences) with fields: ok, fetch_status, blocked_reason, final_url, attempts, retryable_error, security_blocked, title."
 ```
 
 ## `mcporter` Direct Call
