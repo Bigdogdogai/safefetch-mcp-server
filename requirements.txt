@@ -1,0 +1,8 @@
+httpx>=0.27.0
+trafilatura>=1.8.0,<2.0.0
+beautifulsoup4>=4.12.3
+charset-normalizer>=3.3.2
+dnspython>=2.6.1
+tiktoken>=0.7.0
+brotli>=1.1.0
+mcp>=1.2.0; python_version >= "3.10"

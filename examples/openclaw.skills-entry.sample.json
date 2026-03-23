@@ -1,0 +1,12 @@
+{
+  "skills": {
+    "entries": {
+      "webfetch-mcp-v1": {
+        "enabled": true,
+        "env": {
+          "WEBFETCH_ALLOW_CIDRS": "198.18.0.0/15"
+        }
+      }
+    }
+  }
+}
