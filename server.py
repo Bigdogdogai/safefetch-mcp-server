@@ -45,6 +45,12 @@ try:
 except Exception:  # pragma: no cover
     tiktoken = None
 
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout  # type: ignore
+except Exception:  # pragma: no cover
+    sync_playwright = None
+    PlaywrightTimeout = None
+
 
 APP_NAME = "safefetch-v1"
 USER_AGENT = f"{APP_NAME}/1.0"
@@ -60,6 +66,12 @@ RATE_LIMIT_MAX_CALLERS = 1000  # Prevent memory leak
 ALLOW_HTTPS_DOWNGRADE = False
 MIME_ALLOWLIST = ("text/html", "text/plain", "application/json")
 RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+# Playwright settings
+PLAYWRIGHT_TIMEOUT = 30000  # 30 seconds
+PLAYWRIGHT_WAIT_UNTIL = "networkidle"  # Wait for network to be idle
+MIN_CONTENT_LENGTH = 200  # Minimum content length to consider valid (for fallback)
+ENABLE_SMART_FALLBACK = True  # Enable automatic fallback to Playwright
 
 _RATE_BUCKET: Dict[str, List[float]] = OrderedDict()
 mcp = FastMCP(APP_NAME) if FastMCP is not None else None
@@ -308,9 +320,207 @@ def truncate_markdown(md: str, max_tokens: int) -> Tuple[str, bool]:
     return truncated, True
 
 
-def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
+def fetch_with_playwright(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
+    """
+    Fetch a URL using Playwright (headless browser) for JS-rendered content.
+
+    This method is slower but can handle JavaScript-heavy websites that don't
+    work with static HTTP fetching.
+    """
+    if sync_playwright is None:
+        logger.error("Playwright not available - install with: pip install playwright && playwright install chromium")
+        return FetchResult(
+            ok=False,
+            fetch_status="error",
+            blocked_reason="playwright_not_installed",
+            final_url=url,
+            status_code=0,
+            content_type="",
+            title="",
+            markdown="",
+            fetched_at=now_utc(),
+            redirects=0,
+            raw_bytes=0,
+            decompressed_bytes=0,
+            truncated=False,
+        )
+
+    fetched_at = now_utc()
+
+    # Validate URL before launching browser
+    ok, reason = validate_url_and_dns(url)
+    if not ok:
+        logger.warning(f"Playwright fetch blocked: {reason} for {url}")
+        return FetchResult(
+            ok=False,
+            fetch_status="blocked",
+            blocked_reason=reason,
+            final_url=url,
+            status_code=0,
+            content_type="",
+            title="",
+            markdown="",
+            fetched_at=fetched_at,
+            redirects=0,
+            raw_bytes=0,
+            decompressed_bytes=0,
+            truncated=False,
+        )
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 720},
+            )
+            page = context.new_page()
+
+            # Navigate and wait for content
+            logger.info(f"Playwright fetching: {url}")
+            response = page.goto(url, timeout=PLAYWRIGHT_TIMEOUT, wait_until=PLAYWRIGHT_WAIT_UNTIL)
+
+            if response is None:
+                browser.close()
+                return FetchResult(
+                    ok=False,
+                    fetch_status="error",
+                    blocked_reason="no_response",
+                    final_url=url,
+                    status_code=0,
+                    content_type="",
+                    title="",
+                    markdown="",
+                    fetched_at=fetched_at,
+                    redirects=0,
+                    raw_bytes=0,
+                    decompressed_bytes=0,
+                    truncated=False,
+                )
+
+            status_code = response.status
+            final_url = page.url
+
+            # Check if we were redirected to a blocked URL
+            if final_url != url:
+                ok_redirect, reason_redirect = validate_url_and_dns(final_url)
+                if not ok_redirect:
+                    logger.warning(f"Playwright redirect blocked: {reason_redirect} for {final_url}")
+                    browser.close()
+                    return FetchResult(
+                        ok=False,
+                        fetch_status="blocked",
+                        blocked_reason=f"redirect_{reason_redirect}",
+                        final_url=final_url,
+                        status_code=status_code,
+                        content_type="",
+                        title="",
+                        markdown="",
+                        fetched_at=fetched_at,
+                        redirects=1,
+                        raw_bytes=0,
+                        decompressed_bytes=0,
+                        truncated=False,
+                    )
+
+            # Extract content
+            html_content = page.content()
+            raw_bytes = len(html_content.encode('utf-8'))
+
+            # Get title
+            title = page.title()
+
+            # Extract main content using trafilatura
+            markdown = trafilatura.extract(
+                html_content,
+                output_format="markdown",
+                include_comments=False,
+                include_tables=True,
+                include_images=False,
+                deduplicate=True,
+                favor_precision=True,
+            )
+
+            # Fallback to BeautifulSoup if trafilatura fails
+            if not markdown:
+                soup = BeautifulSoup(html_content, "html.parser")
+                markdown = soup.get_text("\n", strip=True)
+
+            markdown = markdown.strip()
+            markdown, truncated = truncate_markdown(markdown, max_tokens=max_tokens)
+
+            browser.close()
+
+            logger.info(f"Playwright successfully fetched {final_url}: {status_code}, {len(markdown)} chars")
+
+            metadata_header = (
+                "# Source\n\n"
+                f"- Title: {title or 'N/A'}\n"
+                f"- URL: {final_url}\n"
+                f"- Fetched At: {fetched_at}\n"
+                f"- Method: Playwright (JS-rendered)\n\n"
+            )
+
+            return FetchResult(
+                ok=True,
+                fetch_status="ok",
+                blocked_reason="",
+                final_url=final_url,
+                status_code=status_code,
+                content_type="text/html",
+                title=title,
+                markdown=(metadata_header + markdown).strip(),
+                fetched_at=fetched_at,
+                redirects=1 if final_url != url else 0,
+                raw_bytes=raw_bytes,
+                decompressed_bytes=raw_bytes,
+                truncated=truncated,
+            )
+
+    except PlaywrightTimeout:
+        logger.warning(f"Playwright timeout for {url}")
+        return FetchResult(
+            ok=False,
+            fetch_status="timeout",
+            blocked_reason="playwright_timeout",
+            final_url=url,
+            status_code=0,
+            content_type="",
+            title="",
+            markdown="",
+            fetched_at=fetched_at,
+            redirects=0,
+            raw_bytes=0,
+            decompressed_bytes=0,
+            truncated=False,
+        )
+    except Exception as exc:
+        logger.error(f"Playwright error for {url}: {exc.__class__.__name__} - {exc}")
+        return FetchResult(
+            ok=False,
+            fetch_status="error",
+            blocked_reason=f"playwright_error:{exc.__class__.__name__}",
+            final_url=url,
+            status_code=0,
+            content_type="",
+            title="",
+            markdown="",
+            fetched_at=fetched_at,
+            redirects=0,
+            raw_bytes=0,
+            decompressed_bytes=0,
+            truncated=False,
+        )
+
+
+def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS, use_playwright: bool = False) -> FetchResult:
     """
     Fetch a URL once with security checks.
+
+    Args:
+        url: The URL to fetch
+        max_tokens: Maximum tokens for content truncation
+        use_playwright: If True, use Playwright (headless browser) instead of httpx
 
     Security Note - DNS TOCTOU:
     There is a theoretical Time-Of-Check-Time-Of-Use (TOCTOU) race condition
@@ -327,6 +537,10 @@ def fetch_once(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
     - Deploying network-level egress filtering
     - Running in a sandboxed network namespace
     """
+    # Route to Playwright if requested
+    if use_playwright:
+        return fetch_with_playwright(url, max_tokens)
+
     fetched_at = now_utc()
     ok, reason = validate_url_and_dns(url)
     if not ok:
@@ -705,7 +919,16 @@ def is_retryable_result(result: FetchResult) -> bool:
     return False
 
 
-def fetch_core(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
+def fetch_core(url: str, max_tokens: int = DEFAULT_MAX_TOKENS, use_playwright: bool = False, enable_fallback: bool = True) -> FetchResult:
+    """
+    Fetch a URL with retry logic and optional smart fallback to Playwright.
+
+    Args:
+        url: The URL to fetch
+        max_tokens: Maximum tokens for content truncation
+        use_playwright: If True, use Playwright directly (skip httpx)
+        enable_fallback: If True, automatically fallback to Playwright if httpx returns insufficient content
+    """
     attempts = 0
     last = FetchResult(
         ok=False,
@@ -724,7 +947,7 @@ def fetch_core(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
     )
     while attempts <= MAX_RETRIES:
         attempts += 1
-        result = fetch_once(url=url, max_tokens=max_tokens)
+        result = fetch_once(url=url, max_tokens=max_tokens, use_playwright=use_playwright)
         result.attempts = attempts
         result.security_blocked = is_security_block(result)
         result.retryable_error = is_retryable_result(result)
@@ -732,6 +955,17 @@ def fetch_core(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
         result.retried = attempts > 1
         last = result
         if result.ok:
+            # Smart fallback: if content is too short and we haven't tried Playwright yet
+            if (enable_fallback and ENABLE_SMART_FALLBACK and not use_playwright
+                and sync_playwright is not None
+                and len(result.markdown) < MIN_CONTENT_LENGTH):
+                logger.info(f"Content too short ({len(result.markdown)} chars), falling back to Playwright for {url}")
+                playwright_result = fetch_with_playwright(url, max_tokens)
+                if playwright_result.ok and len(playwright_result.markdown) > len(result.markdown):
+                    logger.info(f"Playwright fallback successful: {len(playwright_result.markdown)} chars vs {len(result.markdown)} chars")
+                    return playwright_result
+                else:
+                    logger.info(f"Playwright fallback did not improve content, using original result")
             return result
         if not result.retryable_error:
             return result
@@ -740,8 +974,17 @@ def fetch_core(url: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> FetchResult:
     return last
 
 
-def _fetch_url_impl(url: str, caller_id: str = "default", max_tokens: int = DEFAULT_MAX_TOKENS) -> Dict[str, object]:
-    """Fetch webpage content safely and return markdown for LLM usage."""
+def _fetch_url_impl(url: str, caller_id: str = "default", max_tokens: int = DEFAULT_MAX_TOKENS, use_playwright: bool = False, enable_fallback: bool = True) -> Dict[str, object]:
+    """
+    Fetch webpage content safely and return markdown for LLM usage.
+
+    Args:
+        url: The URL to fetch
+        caller_id: Identifier for rate limiting
+        max_tokens: Maximum tokens for content truncation
+        use_playwright: If True, use Playwright (headless browser) instead of httpx
+        enable_fallback: If True, automatically fallback to Playwright if httpx returns insufficient content
+    """
     if not allow_request(caller_id):
         return FetchResult(
             ok=False,
@@ -758,18 +1001,31 @@ def _fetch_url_impl(url: str, caller_id: str = "default", max_tokens: int = DEFA
             decompressed_bytes=0,
             truncated=False,
         ).to_dict()
-    return fetch_core(url=url, max_tokens=max_tokens).to_dict()
+    return fetch_core(url=url, max_tokens=max_tokens, use_playwright=use_playwright, enable_fallback=enable_fallback).to_dict()
 
 
 if mcp is not None:
 
     @mcp.tool()
-    def fetch_url(url: str, caller_id: str = "default", max_tokens: int = DEFAULT_MAX_TOKENS) -> Dict[str, object]:
-        return _fetch_url_impl(url=url, caller_id=caller_id, max_tokens=max_tokens)
+    def fetch_url(url: str, caller_id: str = "default", max_tokens: int = DEFAULT_MAX_TOKENS, use_playwright: bool = False, enable_fallback: bool = True) -> Dict[str, object]:
+        """
+        Fetch webpage content and convert to markdown.
+
+        Args:
+            url: The URL to fetch
+            caller_id: Identifier for rate limiting (default: "default")
+            max_tokens: Maximum tokens for content truncation (default: 3000)
+            use_playwright: Use headless browser for JS-rendered sites (default: False, slower but handles JS)
+            enable_fallback: Auto-fallback to Playwright if content is too short (default: True)
+
+        Returns:
+            Dictionary with fetch results including markdown content
+        """
+        return _fetch_url_impl(url=url, caller_id=caller_id, max_tokens=max_tokens, use_playwright=use_playwright, enable_fallback=enable_fallback)
 
 else:
-    def fetch_url(url: str, caller_id: str = "default", max_tokens: int = DEFAULT_MAX_TOKENS) -> Dict[str, object]:
-        return _fetch_url_impl(url=url, caller_id=caller_id, max_tokens=max_tokens)
+    def fetch_url(url: str, caller_id: str = "default", max_tokens: int = DEFAULT_MAX_TOKENS, use_playwright: bool = False, enable_fallback: bool = True) -> Dict[str, object]:
+        return _fetch_url_impl(url=url, caller_id=caller_id, max_tokens=max_tokens, use_playwright=use_playwright, enable_fallback=enable_fallback)
 
 
 def run_self_test() -> int:
