@@ -42,8 +42,8 @@ python -m pip install -U pip
 python -m pip install -r requirements.txt
 
 if [[ "${SKIP_TEST}" -eq 0 ]]; then
-  echo "[3/4] Running self-test..."
-  python server.py --self-test
+  echo "[3/4] Running offline self-test..."
+  python -m safefetch --self-test
 else
   echo "[3/4] Self-test skipped (--skip-test)."
 fi
@@ -51,7 +51,7 @@ fi
 echo "[4/4] Done."
 echo
 echo "Run MCP server:"
-echo "  source .venv/bin/activate && python server.py"
+echo "  source .venv/bin/activate && python -m safefetch"
 echo
 echo "Example mcporter stdio command:"
-echo "  mcporter call --stdio \"env WEBFETCH_ALLOW_CIDRS=\${WEBFETCH_ALLOW_CIDRS:-} ${ROOT_DIR}/.venv/bin/python ${ROOT_DIR}/server.py\" fetch_url url=https://example.com caller_id=openclaw-agent max_tokens=3000"
+echo "  mcporter call --stdio \"env WEBFETCH_ALLOW_CIDRS=\${WEBFETCH_ALLOW_CIDRS:-} ${ROOT_DIR}/.venv/bin/python -m safefetch\" fetch_url url=https://example.com caller_id=openclaw-agent max_tokens=3000"

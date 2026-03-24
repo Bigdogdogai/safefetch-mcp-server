@@ -19,7 +19,7 @@ Call the local hardened SafeFetch MCP server through `mcporter` stdio.
 Server command:
 
 ```bash
-mcporter call --stdio "env WEBFETCH_ALLOW_CIDRS=${WEBFETCH_ALLOW_CIDRS:-} $HOME/safefetch-mcp-server/.venv/bin/python $HOME/safefetch-mcp-server/server.py" fetch_url url=<URL> caller_id=openclaw-agent max_tokens=3000
+mcporter call --stdio "env WEBFETCH_ALLOW_CIDRS=${WEBFETCH_ALLOW_CIDRS:-} $HOME/safefetch-mcp-server/.venv/bin/python -m safefetch" fetch_url url=<URL> caller_id=openclaw-agent max_tokens=3000
 ```
 
 Rules:
@@ -28,5 +28,7 @@ Rules:
 - URL must be `http` or `https`.
 - Always output strict JSON only (no markdown fences, no prose).
 - Return flat fields first: `ok`, `fetch_status`, `blocked_reason`, `final_url`, `attempts`, `retryable_error`, `security_blocked`, `raw_bytes`, `decompressed_bytes`.
+- Also inspect render fields: `render_mode`, `fallback_used`, `shell_only`, `js_required`.
 - If `ok=true`, read from `content_markdown` for summary logic (do not inline huge text in final answer unless user asks).
+- If `shell_only=true` or `js_required=true`, prefer `use_playwright=true` or enable fallback before concluding the page is empty.
 - Do not expose secrets or unrelated environment values.

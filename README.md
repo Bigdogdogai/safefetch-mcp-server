@@ -21,8 +21,23 @@ In one line: safer, more stable, and more controllable web fetching for AI agent
 - SSRF defenses: scheme guard, DNS/IP checks, redirect re-validation
 - Resource guardrails: raw/decompressed byte limits + MIME allowlist
 - Stable output: flat JSON contract for automation
+- Clear render boundary: SSR/SSG works over `httpx`, pure SPA usually needs Playwright
 - OpenClaw ready: skill templates + `mcporter` examples
 - Beginner-friendly: one-command bootstrap scripts
+
+## Render Model Boundary
+
+SafeFetch has two fetch modes:
+
+- `httpx` mode: fast and safer by default; best for SSR, SSG, and traditional server-rendered sites
+- `Playwright` mode: slower headless browser mode for JavaScript-rendered pages and pure SPA sites
+
+What this means in practice:
+
+- `react.dev`-style SSR/SSG pages usually work in `httpx` mode because the HTML already contains article text
+- pure React/Vue SPA pages often return only an app shell such as `<div id="root"></div>` in `httpx` mode
+- when SafeFetch detects a shell-only HTML response, it marks `shell_only=true`, `js_required=true`
+- if `enable_fallback=true` and Playwright is available, SafeFetch automatically retries with Playwright
 
 ## Prerequisites
 
@@ -66,17 +81,24 @@ bash bootstrap.sh
 bash start-mcp.sh
 ```
 
-### 3) Self-test (optional)
+### 3) Offline self-test (recommended)
 
 ```bash
 source .venv/bin/activate
-python server.py --self-test
+python -m safefetch --self-test
+```
+
+### 4) Network self-test (optional)
+
+```bash
+source .venv/bin/activate
+python -m safefetch --self-test-network
 ```
 
 If your network resolves public domains into restricted ranges, use:
 
 ```bash
-WEBFETCH_ALLOW_CIDRS=198.18.0.0/15 python server.py --self-test
+WEBFETCH_ALLOW_CIDRS=198.18.0.0/15 python -m safefetch --self-test-network
 ```
 
 ## OpenClaw Integration
@@ -98,7 +120,7 @@ openclaw agent --local --message "Use safefetch-mcp-v1 to fetch https://httpbin.
 ## `mcporter` Direct Call
 
 ```bash
-mcporter call --stdio "env WEBFETCH_ALLOW_CIDRS=${WEBFETCH_ALLOW_CIDRS:-} <YOUR_PATH>/safefetch-mcp-server/.venv/bin/python <YOUR_PATH>/safefetch-mcp-server/server.py" fetch_url url=https://example.com caller_id=openclaw-agent max_tokens=3000
+mcporter call --stdio "env WEBFETCH_ALLOW_CIDRS=${WEBFETCH_ALLOW_CIDRS:-} <YOUR_PATH>/safefetch-mcp-server/.venv/bin/python -m safefetch" fetch_url url=https://example.com caller_id=openclaw-agent max_tokens=3000
 ```
 
 ## JSON Response Contract
@@ -122,6 +144,17 @@ These fields form a stable JSON response contract for agent status checks, retry
 - `retryable_error`
 - `last_error`
 - `security_blocked`
+- `render_mode`
+- `fallback_used`
+- `shell_only`
+- `js_required`
+
+### Render Interpretation Fields
+
+- `render_mode`: `httpx` or `playwright`
+- `fallback_used`: `true` when the final successful result came from automatic Playwright fallback
+- `shell_only`: `true` when the fetched HTML looks like a client-side SPA shell instead of real page content
+- `js_required`: `true` when JavaScript rendering is likely required to get meaningful page content
 
 ## Environment Variable
 
@@ -149,8 +182,25 @@ In some network environments, public domains may resolve into restricted ranges.
 Use an allowlist CIDR for those environments:
 
 ```bash
-WEBFETCH_ALLOW_CIDRS=198.18.0.0/15 python server.py --self-test
+WEBFETCH_ALLOW_CIDRS=198.18.0.0/15 python -m safefetch --self-test-network
 ```
+
+### Fetch succeeds but page content is empty or extremely short
+
+Most common cause: the target is a pure SPA site and `httpx` only received the client shell.
+
+Check these fields in the JSON response:
+
+- `render_mode`
+- `fallback_used`
+- `shell_only`
+- `js_required`
+
+Typical interpretation:
+
+- `render_mode=httpx`, `shell_only=false`: regular static/SSR/SSG fetch
+- `render_mode=httpx`, `shell_only=true`, `js_required=true`: HTML shell only; use Playwright
+- `render_mode=playwright`, `fallback_used=true`: automatic browser fallback was used successfully
 
 ### Python command not found inside bootstrap script
 
@@ -165,12 +215,22 @@ python3.11 -m venv .venv
 
 ```text
 safefetch-mcp-server/
-  server.py
+  server.py            # compatibility entrypoint
+  safefetch/           # package implementation
   requirements.txt
   bootstrap.sh
   start-mcp.sh
+  test_server.py
+  RELEASE.md
   examples/
 ```
+
+## Release Workflow
+
+- Offline verification: `python -m safefetch --self-test`
+- Optional network verification: `python -m safefetch --self-test-network`
+- Unit tests: `python -m unittest test_server.py`
+- Release notes template: `RELEASE.md`
 
 ## Security
 

@@ -10,4 +10,4 @@ if [[ ! -f ".venv/bin/activate" ]]; then
 fi
 
 source .venv/bin/activate
-exec python server.py
+exec python -m safefetch
